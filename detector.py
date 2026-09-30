@@ -1,5 +1,7 @@
 import serial
 import numpy as np
+import torch
+import torch.nn as nn
 import subprocess
 import math
 import struct
@@ -10,18 +12,115 @@ PORT = "/dev/ttyACM0"
 BAUDRATE = 1000000
 
 PHASES = 201
-BASE_FILE = "BASE_MODEL.npz"
+MODEL_FILE = "METAL_MODEL.pt"
 
-MAX_SAMPLES = 20
+AI_SAMPLES = 20
 
-BEEP_THRESHOLD = 9
-LOUD_BEEP_THRESHOLD = 13
-
-BEEP_DURATION = 0.06
 SAMPLE_RATE = 44100
+BEEP_DURATION = 0.06
 
 BEEP_VOLUME = 0.10
 LOUD_BEEP_VOLUME = 0.20
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+class ConvAutoencoder(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Conv1d(1, 16, 5, stride=2, padding=2),
+            nn.ReLU(),
+
+            nn.Conv1d(16, 32, 5, stride=2, padding=2),
+            nn.ReLU(),
+
+            nn.Conv1d(32, 16, 5, stride=2, padding=2),
+            nn.ReLU()
+        )
+
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose1d(
+                16,
+                32,
+                5,
+                stride=2,
+                padding=2,
+                output_padding=0
+            ),
+            nn.ReLU(),
+
+            nn.ConvTranspose1d(
+                32,
+                16,
+                5,
+                stride=2,
+                padding=2,
+                output_padding=0
+            ),
+            nn.ReLU(),
+
+            nn.ConvTranspose1d(
+                16,
+                1,
+                5,
+                stride=2,
+                padding=2,
+                output_padding=0
+            )
+        )
+
+    def forward(self, x):
+
+        encoded = self.encoder(x)
+
+        decoded = self.decoder(encoded)
+
+        decoded = decoded[:, :, :PHASES]
+
+        if decoded.shape[2] < PHASES:
+            decoded = nn.functional.pad(
+                decoded,
+                (0, PHASES - decoded.shape[2])
+            )
+
+        return decoded
+
+
+checkpoint = torch.load(
+    MODEL_FILE,
+    map_location=DEVICE
+)
+
+model = ConvAutoencoder().to(DEVICE)
+
+model.load_state_dict(
+    checkpoint["model_state"]
+)
+
+model.eval()
+
+mean = checkpoint["mean"].astype(
+    np.float32
+)
+
+scale = float(
+    checkpoint["scale"]
+)
+
+threshold = float(
+    checkpoint["threshold"]
+)
+
+if scale < 0.1:
+    scale = 0.1
+
+if checkpoint["phases"] != PHASES:
+    raise RuntimeError(
+        "Model phase count does not match detector"
+    )
 
 ser = serial.Serial(
     PORT,
@@ -31,38 +130,62 @@ ser = serial.Serial(
 
 ser.reset_input_buffer()
 
-model = np.load(BASE_FILE)
-
-base_waveform = model["base_waveform"].astype(np.float32)
-
-if base_waveform.shape != (PHASES,):
-    raise RuntimeError(
-        f"Invalid base waveform shape: {base_waveform.shape}"
-    )
-
-max_queue = queue.Queue(maxsize=MAX_SAMPLES)
+ai_queue = queue.Queue(
+    maxsize=AI_SAMPLES
+)
 
 
 def beep_worker():
 
-    max_values = []
+    scores = []
 
     while True:
 
-        max_difference = max_queue.get()
+        score = ai_queue.get()
 
-        max_values.append(max_difference)
+        scores.append(score)
 
-        if len(max_values) < MAX_SAMPLES:
+        if len(scores) < AI_SAMPLES:
 
-            max_queue.task_done()
+            ai_queue.task_done()
+
             continue
 
-        average_max = np.mean(max_values)
+        average_score = float(
+            np.mean(scores)
+        )
 
-        if average_max > BEEP_THRESHOLD:
+        detection = (
+            average_score > threshold
+        )
 
-            if average_max > LOUD_BEEP_THRESHOLD:
+        print(
+            f"AI average: {average_score:.6f} | "
+            f"Threshold: {threshold:.6f} | "
+            f"DETECTION: {detection}",
+            flush=True
+        )
+
+        if detection:
+
+            ratio = (
+                average_score /
+                threshold
+            )
+
+            ratio = max(
+                1.0,
+                min(ratio, 4.0)
+            )
+
+            frequency = int(
+                min(
+                    2500,
+                    500 + ratio * 500
+                )
+            )
+
+            if ratio > 2.0:
 
                 beep_volume = LOUD_BEEP_VOLUME
 
@@ -70,19 +193,14 @@ def beep_worker():
 
                 beep_volume = BEEP_VOLUME
 
-            frequency = int(
-                min(
-                    2500,
-                    500 + average_max * 100
-                )
-            )
-
             samples = int(
-                SAMPLE_RATE * BEEP_DURATION
+                SAMPLE_RATE *
+                BEEP_DURATION
             )
 
             fade_samples = int(
-                SAMPLE_RATE * 0.004
+                SAMPLE_RATE *
+                0.004
             )
 
             audio = bytearray()
@@ -91,7 +209,10 @@ def beep_worker():
 
                 if i < fade_samples:
 
-                    envelope = i / fade_samples
+                    envelope = (
+                        i /
+                        fade_samples
+                    )
 
                 elif i >= samples - fade_samples:
 
@@ -149,9 +270,9 @@ def beep_worker():
 
                 process.kill()
 
-        max_values.clear()
+        scores.clear()
 
-        max_queue.task_done()
+        ai_queue.task_done()
 
 
 audio_thread = threading.Thread(
@@ -198,70 +319,91 @@ while True:
 
         if not started:
 
-            if last_phase == 201 and phase == 1:
+            if (
+                last_phase == 201
+                and phase == 1
+            ):
 
                 started = True
+
                 phase_index = 1
+
                 waveform[0] = value
 
             last_phase = phase
+
             continue
 
-        expected_phase = phase_index + 1
+        expected_phase = (
+            phase_index + 1
+        )
 
         if phase != expected_phase:
 
-            if last_phase == 201 and phase == 1:
+            if (
+                last_phase == 201
+                and phase == 1
+            ):
 
                 phase_index = 1
+
                 waveform[0] = value
 
             else:
 
                 started = False
+
                 phase_index = 0
 
             last_phase = phase
+
             continue
 
         waveform[phase_index] = value
 
         phase_index += 1
+
         last_phase = phase
 
         if phase_index == PHASES:
 
             wave_count += 1
 
-            difference = (
-                waveform - base_waveform
-            )
+            normalized = (
+                waveform - mean
+            ) / scale
 
-            abs_difference = np.abs(
-                difference
-            )
+            tensor = torch.from_numpy(
+                normalized
+            ).float().view(
+                1,
+                1,
+                PHASES
+            ).to(DEVICE)
 
-            rmse = np.sqrt(
-                np.mean(
-                    difference * difference
+            with torch.no_grad():
+
+                reconstructed = model(
+                    tensor
                 )
-            )
 
-            max_difference = np.max(
-                abs_difference
-            )
+                error = torch.mean(
+                    (
+                        reconstructed -
+                        tensor
+                    ) ** 2
+                ).item()
 
             print(
                 f"Wave: {wave_count} | "
-                f"RMSE: {rmse:.2f} | "
-                f"MAX: {max_difference:.2f}",
+                f"AI: {error:.6f}",
                 flush=True
             )
 
             try:
 
-                max_queue.put_nowait(
-                    max_difference
+                ai_queue.put_nowait(
+                    error
                 )
 
             except queue.Full:
