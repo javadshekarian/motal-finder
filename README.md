@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./GIFs/metal_finder.gif" alt="Metal Finder Demo" width="250" />
+  <img src="./GIFs/metal_finder.gif" alt="Metal Finder Demo" width="200" />
 </p>
 
 <h1 align="center">🧲 Arduino Metal Detector — ADC + PCA Waveform Pipeline</h1>
