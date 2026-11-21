@@ -1,84 +1,17 @@
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
 
 INPUT_FILE = "DATA.bin"
-OUTPUT_FILE = "METAL_MODEL.pt"
+OUTPUT_FILE = "METAL_MODEL.npz"
 
-PHASES = 201
+PHASES = 64
+WAVEFORMS = 1005
 
-EPOCHS = 80
-BATCH_SIZE = 128
-LEARNING_RATE = 0.001
+COMPONENTS = 8
 
 VALIDATION_RATIO = 0.20
-THRESHOLD_PERCENTILE = 99.5
+THRESHOLD_PERCENTILE = 99.0
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-class ConvAutoencoder(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-
-        self.encoder = nn.Sequential(
-            nn.Conv1d(1, 16, 5, stride=2, padding=2),
-            nn.ReLU(),
-
-            nn.Conv1d(16, 32, 5, stride=2, padding=2),
-            nn.ReLU(),
-
-            nn.Conv1d(32, 16, 5, stride=2, padding=2),
-            nn.ReLU()
-        )
-
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose1d(
-                16,
-                32,
-                5,
-                stride=2,
-                padding=2,
-                output_padding=0
-            ),
-            nn.ReLU(),
-
-            nn.ConvTranspose1d(
-                32,
-                16,
-                5,
-                stride=2,
-                padding=2,
-                output_padding=0
-            ),
-            nn.ReLU(),
-
-            nn.ConvTranspose1d(
-                16,
-                1,
-                5,
-                stride=2,
-                padding=2,
-                output_padding=0
-            )
-        )
-
-    def forward(self, x):
-
-        encoded = self.encoder(x)
-        decoded = self.decoder(encoded)
-
-        decoded = decoded[:, :, :PHASES]
-
-        if decoded.shape[2] < PHASES:
-            decoded = nn.functional.pad(
-                decoded,
-                (0, PHASES - decoded.shape[2])
-            )
-
-        return decoded
+EIGENVALUE_FLOOR = 1e-6
 
 
 data = np.fromfile(
@@ -86,177 +19,265 @@ data = np.fromfile(
     dtype="<u2"
 ).astype(np.float32)
 
-wave_count = len(data) // PHASES
+expected_samples = (
+    WAVEFORMS *
+    PHASES
+)
 
-if wave_count < 100:
-    raise RuntimeError(
-        f"Not enough complete waveforms: {wave_count}"
+print(
+    f"File samples:     {len(data)}"
+)
+
+print(
+    f"Expected samples: {expected_samples}"
+)
+
+if len(data) != expected_samples:
+
+    raise ValueError(
+        f"Invalid DATA.bin: expected "
+        f"{expected_samples} samples, "
+        f"but got {len(data)}"
     )
 
-data = data[:wave_count * PHASES]
-
 waves = data.reshape(
-    wave_count,
+    WAVEFORMS,
     PHASES
 )
 
 np.random.seed(42)
 
-indices = np.random.permutation(wave_count)
+indices = np.random.permutation(
+    WAVEFORMS
+)
 
 waves = waves[indices]
 
 validation_count = int(
-    wave_count * VALIDATION_RATIO
+    WAVEFORMS *
+    VALIDATION_RATIO
 )
 
-train_waves = waves[:-validation_count]
-validation_waves = waves[-validation_count:]
+train_waves = waves[
+    :-validation_count
+]
+
+validation_waves = waves[
+    -validation_count:
+]
 
 mean = np.mean(
     train_waves,
     axis=0
 )
 
-scale = np.std(
+centered_train = (
+    train_waves -
+    mean
+)
+
+covariance = np.cov(
+    centered_train,
+    rowvar=False
+)
+
+eigenvalues, eigenvectors = (
+    np.linalg.eigh(covariance)
+)
+
+order = np.argsort(
+    eigenvalues
+)[::-1]
+
+eigenvalues = eigenvalues[
+    order
+]
+
+eigenvectors = eigenvectors[
+    :,
+    order
+]
+
+components = eigenvectors[
+    :,
+    :COMPONENTS
+]
+
+selected_eigenvalues = eigenvalues[
+    :COMPONENTS
+]
+
+selected_eigenvalues = np.maximum(
+    selected_eigenvalues,
+    EIGENVALUE_FLOOR
+)
+
+
+def calculate_scores(
+    input_waves
+):
+
+    centered = (
+        input_waves -
+        mean
+    )
+
+    latent = (
+        centered @
+        components
+    )
+
+    reconstructed = (
+        latent @
+        components.T
+    )
+
+    residual = (
+        centered -
+        reconstructed
+    )
+
+    q_score = np.sum(
+        residual * residual,
+        axis=1
+    )
+
+    t2_score = np.sum(
+        (
+            latent * latent
+        ) /
+        selected_eigenvalues,
+        axis=1
+    )
+
+    return (
+        q_score,
+        t2_score
+    )
+
+
+train_q, train_t2 = calculate_scores(
     train_waves
 )
 
-if scale < 0.1:
-    scale = 0.1
-
-train_normalized = (
-    train_waves - mean
-) / scale
-
-validation_normalized = (
-    validation_waves - mean
-) / scale
-
-train_tensor = torch.from_numpy(
-    train_normalized
-).float().unsqueeze(1)
-
-validation_tensor = torch.from_numpy(
-    validation_normalized
-).float().unsqueeze(1)
-
-train_loader = DataLoader(
-    TensorDataset(train_tensor),
-    batch_size=BATCH_SIZE,
-    shuffle=True
+validation_q, validation_t2 = calculate_scores(
+    validation_waves
 )
 
-model = ConvAutoencoder().to(DEVICE)
-
-optimizer = torch.optim.Adam(
-    model.parameters(),
-    lr=LEARNING_RATE
-)
-
-loss_function = nn.MSELoss()
-
-print("TRAINING MODEL")
-print("--------------")
-print(f"Device:          {DEVICE}")
-print(f"Waveforms:       {wave_count}")
-print(f"Training:        {len(train_waves)}")
-print(f"Validation:      {len(validation_waves)}")
-print(f"Phases:          {PHASES}")
-
-for epoch in range(EPOCHS):
-
-    model.train()
-
-    total_loss = 0.0
-
-    for batch, in train_loader:
-
-        batch = batch.to(DEVICE)
-
-        optimizer.zero_grad()
-
-        reconstructed = model(batch)
-
-        loss = loss_function(
-            reconstructed,
-            batch
-        )
-
-        loss.backward()
-
-        optimizer.step()
-
-        total_loss += loss.item()
-
-    average_loss = (
-        total_loss /
-        len(train_loader)
-    )
-
-    if (
-        epoch == 0
-        or (epoch + 1) % 10 == 0
-    ):
-        print(
-            f"Epoch {epoch + 1:3d}/{EPOCHS} | "
-            f"Loss: {average_loss:.6f}"
-        )
-
-
-model.eval()
-
-with torch.no_grad():
-
-    validation_input = validation_tensor.to(DEVICE)
-
-    validation_output = model(
-        validation_input
-    )
-
-    errors = torch.mean(
-        (
-            validation_output -
-            validation_input
-        ) ** 2,
-        dim=(1, 2)
-    )
-
-    errors = errors.cpu().numpy()
-
-threshold = float(
+q_threshold = float(
     np.percentile(
-        errors,
+        validation_q,
         THRESHOLD_PERCENTILE
     )
 )
 
-train_error = float(
-    np.mean(errors)
+t2_threshold = float(
+    np.percentile(
+        validation_t2,
+        THRESHOLD_PERCENTILE
+    )
 )
 
-max_error = float(
-    np.max(errors)
+combined_validation = np.maximum(
+    validation_q / max(q_threshold, 1e-12),
+    validation_t2 / max(t2_threshold, 1e-12)
 )
 
-torch.save(
-    {
-        "model_state": model.state_dict(),
-        "mean": mean.astype(np.float32),
-        "scale": np.float32(scale),
-        "threshold": np.float32(threshold),
-        "phases": PHASES
-    },
-    OUTPUT_FILE
+combined_threshold = float(
+    np.percentile(
+        combined_validation,
+        THRESHOLD_PERCENTILE
+    )
 )
+
+explained_variance = float(
+    np.sum(selected_eigenvalues)
+    /
+    np.sum(
+        np.maximum(
+            eigenvalues,
+            EIGENVALUE_FLOOR
+        )
+    )
+    * 100.0
+)
+
+
+np.savez(
+    OUTPUT_FILE,
+
+    mean=mean.astype(
+        np.float32
+    ),
+
+    components=components.astype(
+        np.float32
+    ),
+
+    eigenvalues=selected_eigenvalues.astype(
+        np.float32
+    ),
+
+    q_threshold=np.float32(
+        q_threshold
+    ),
+
+    t2_threshold=np.float32(
+        t2_threshold
+    ),
+
+    combined_threshold=np.float32(
+        combined_threshold
+    ),
+
+    phases=np.int32(
+        PHASES
+    ),
+
+    components_count=np.int32(
+        COMPONENTS
+    )
+)
+
 
 print()
 print("MODEL CREATED")
 print("-------------")
-print(f"Output:          {OUTPUT_FILE}")
-print(f"Waveforms:       {wave_count}")
-print(f"Validation:      {len(validation_waves)}")
-print(f"Mean error:      {train_error:.6f}")
-print(f"Max error:       {max_error:.6f}")
-print(f"Threshold:       {threshold:.6f}")
-print(f"Percentile:      {THRESHOLD_PERCENTILE}")
+print(
+    f"Output:              {OUTPUT_FILE}"
+)
+print(
+    f"Waveforms:           {WAVEFORMS}"
+)
+print(
+    f"Training:            {len(train_waves)}"
+)
+print(
+    f"Validation:          {len(validation_waves)}"
+)
+print(
+    f"Phases:              {PHASES}"
+)
+print(
+    f"Components:          {COMPONENTS}"
+)
+print(
+    f"Explained variance:  {explained_variance:.4f}%"
+)
+print(
+    f"Q threshold:         {q_threshold:.6f}"
+)
+print(
+    f"T2 threshold:        {t2_threshold:.6f}"
+)
+print(
+    f"Combined threshold:  {combined_threshold:.6f}"
+)
+
+print()
+print("MEAN:")
+print(mean)
+
+print()
+print("EIGENVALUES:")
+print(selected_eigenvalues)

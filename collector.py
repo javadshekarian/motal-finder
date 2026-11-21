@@ -1,163 +1,94 @@
+
 import serial
-import numpy as np
 import time
+from pathlib import Path
 
 PORT = "/dev/ttyACM0"
-BAUDRATE = 1000000
+BAUD = 1_000_000
 
-PHASES = 201
-WAVEFORMS = 2000
+SAMPLES = 16
+FRAME_SIZE = 32
+TARGET_SIZE = 4 * 1024
 
-OUTPUT_FILE = "DATA.bin"
+OUTPUT = Path("TEST.bin")
 
-SYNC_PHASES = 8
-
-ser = serial.Serial(
-    PORT,
-    BAUDRATE,
-    timeout=None
-)
-
+ser = serial.Serial(PORT, BAUD, timeout=1)
 ser.reset_input_buffer()
 
-buffer = bytearray()
-
-waveform = np.empty(
-    PHASES,
-    dtype=np.uint16
-)
-
-synced = False
-phase_index = 0
-waveform_count = 0
-
-last_log = time.time()
 total_bytes = 0
+valid_frames = 0
+invalid_frames = 0
+start_time = time.time()
 
-with open(OUTPUT_FILE, "wb") as f:
+print(f"Target: {TARGET_SIZE} bytes")
+print("Receiving...")
 
-    while waveform_count < WAVEFORMS:
+try:
+    with OUTPUT.open("wb") as file:
+        while total_bytes < TARGET_SIZE:
+            frame = ser.read(FRAME_SIZE)
 
-        data = ser.read(4096)
-
-        if not data:
-            continue
-
-        buffer.extend(data)
-        total_bytes += len(data)
-
-        if not synced:
-
-            found = False
-
-            max_offset = min(
-                3,
-                len(buffer)
-            )
-
-            for offset in range(max_offset):
-
-                required = offset + (SYNC_PHASES * 3)
-
-                if len(buffer) < required:
-                    break
-
-                valid = True
-
-                for i in range(SYNC_PHASES):
-
-                    phase = buffer[
-                        offset + i * 3 + 2
-                    ]
-
-                    if phase != i + 1:
-                        valid = False
-                        break
-
-                if valid:
-
-                    if offset:
-                        del buffer[:offset]
-
-                    synced = True
-                    phase_index = 0
-                    found = True
-
-                    break
-
-            if not found:
-
-                if len(buffer) > 32:
-                    del buffer[:-32]
-
-                if time.time() - last_log >= 2:
-
-                    print(
-                        f"Waiting for sync | "
-                        f"received: {total_bytes} bytes",
-                        flush=True
-                    )
-
-                    last_log = time.time()
-
+            if len(frame) != FRAME_SIZE:
                 continue
 
-        while synced and len(buffer) >= 3:
+            values = []
+            valid = True
 
-            value = (
-                buffer[0]
-                | (buffer[1] << 8)
+            for i in range(SAMPLES):
+                hi = frame[i * 2]
+                lo = frame[i * 2 + 1]
+
+                index = hi >> 4
+                adc = ((hi & 0x0F) << 8) | lo
+
+                if index != i:
+                    valid = False
+                    break
+
+                values.append(adc)
+
+            if not valid:
+                invalid_frames += 1
+                continue
+
+            file.write(frame)
+            total_bytes += FRAME_SIZE
+            valid_frames += 1
+
+            elapsed = time.time() - start_time
+            rate = total_bytes / elapsed / 1024 if elapsed else 0
+
+            print(
+                f"\rReceived: {total_bytes}/{TARGET_SIZE} bytes | "
+                f"Frames: {valid_frames} | "
+                f"Invalid: {invalid_frames} | "
+                f"Rate: {rate:.2f} KB/s",
+                end="",
+                flush=True
             )
 
-            phase = buffer[2]
+except KeyboardInterrupt:
+    print("\nStopped.")
 
-            del buffer[:3]
+finally:
+    ser.close()
 
-            expected_phase = phase_index + 1
+data = OUTPUT.read_bytes()
 
-            if phase != expected_phase:
+samples = [
+    ((data[i] & 0x0F) << 8) | data[i + 1]
+    for i in range(0, len(data), 2)
+]
 
-                synced = False
-                phase_index = 0
-
-                break
-
-            waveform[phase_index] = value
-
-            phase_index += 1
-
-            if phase_index == PHASES:
-
-                waveform.tofile(f)
-                f.flush()
-
-                waveform_count += 1
-
-                samples = (
-                    waveform_count * PHASES
-                )
-
-                size = (
-                    waveform_count
-                    * PHASES
-                    * 2
-                )
-
-                print(
-                    f"{waveform_count}/{WAVEFORMS} waves | "
-                    f"{samples} samples | "
-                    f"{size} bytes",
-                    flush=True
-                )
-
-                synced = False
-                phase_index = 0
-
-ser.close()
-
-print()
-print("COLLECTION COMPLETE")
-print(f"Waveforms: {waveform_count}")
-print(f"Samples:   {waveform_count * PHASES}")
-print(f"Bytes:     {waveform_count * PHASES * 2}")
-print(f"Output:    {OUTPUT_FILE}")
+print("\n\n========== RESULT ==========")
+print(f"File:          {OUTPUT}")
+print(f"Received:      {len(data)} bytes")
+print(f"Valid frames:  {valid_frames}")
+print(f"Invalid:       {invalid_frames}")
+print(f"Samples:       {len(samples)}")
+print(f"ADC min:       {min(samples) if samples else 0}")
+print(f"ADC max:       {max(samples) if samples else 0}")
+print(f"ADC mean:      {sum(samples) / len(samples) if samples else 0:.3f}")
+print(f"Zero samples:  {sum(v == 0 for v in samples)}")
+print(f"Non-zero:      {sum(v != 0 for v in samples)}")
+print("============================")
