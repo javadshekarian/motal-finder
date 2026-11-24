@@ -22,8 +22,5 @@ for sample in range(16):
         columns=[f"Position {i+1}" for i in range(GROUP_SIZE)]
     )
 
-    filename = output_dir / f"sample_{sample+1:02}.csv"
-    df.to_csv(filename)
-
     print(f"\nSample {sample+1} | Shape: {df.shape}")
     print(df.to_string())
