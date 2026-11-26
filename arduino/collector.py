@@ -2,7 +2,7 @@ import serial
 import struct
 import time
 
-PORT = "/dev/ttyACM0"
+PORT = "/tmp/arduino-proxy"
 BAUD = 1000000
 
 CAPTURE_SECONDS = 4.0
@@ -16,7 +16,7 @@ def decode_frame(data):
     for index, word in enumerate(words):
         if (word >> 12) != index:
             return None
-        if word & 0x0C00:
+        if index not in (1, 2) and (word & 0x0C00):
             return None
 
     return [word & 0x03FF for word in words]
