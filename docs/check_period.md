@@ -1,4 +1,3 @@
-```markdown
 # BASE Wave-to-Wave Repeatability Analysis
 
 ## Overview
@@ -17,7 +16,6 @@ The absolute difference is calculated as:
 
 ```text
 Error = abs(Current_Sample - Previous_Sample)
-```
 
 All measurements are converted to a signed integer type before subtraction to prevent unsigned integer overflow.
 
