@@ -1,4 +1,3 @@
-
 import struct
 
 FILE = "BASE.bin"
@@ -17,4 +16,13 @@ for wave in range(WAVE_COUNT):
     start = wave * SAMPLES_PER_WAVE
     samples = values[start:start + SAMPLES_PER_WAVE]
 
-    print(f"Wave {wave + 1:03d}: {list(samples)}")
+    counter_low = (samples[1] >> 10) & 0b11
+    counter_high = (samples[2] >> 10) & 0b11
+
+    phase = (counter_high << 2) | counter_low
+
+    print(
+        f"Wave {wave + 1:03d} | "
+        f"Phase {phase:02d} | "
+        f"{list(samples)}"
+    )

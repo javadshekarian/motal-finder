@@ -19,7 +19,7 @@ def decode_frame(data):
         if index not in (1, 2) and (word & 0x0C00):
             return None
 
-    return [word & 0x03FF for word in words]
+    return list(words)
 
 def main():
     raw = bytearray()
